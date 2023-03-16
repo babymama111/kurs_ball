@@ -1,0 +1,455 @@
+from scipy.optimize import minimize, differential_evolution
+import numpy as np
+import pandas as pd
+import sys
+import os
+
+from matplotlib import cm
+from matplotlib.colors import ListedColormap, LinearSegmentedColormap
+from matplotlib.patches import Patch
+from matplotlib.lines import Line2D
+
+from tqdm.notebook import tqdm
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+mpl.rcParams['figure.figsize'] = (6,4) 
+import json
+
+from pyballistics import ozvb_lagrange
+from pyballistics import get_powder_names
+
+# %config InlineBackend.figure_format = 'svg' 
+%matplotlib inline
+
+viridis = cm.get_cmap('Blues_r', 1024)
+newcolors = viridis(np.linspace(0, 1, 1024))
+newcolors[:52, :] = cm.get_cmap('winter_r', 52)(np.linspace(0.0, 0.5, 52))
+newcmp = ListedColormap(newcolors)
+
+
+styles = {
+    'p_max': {'color': 'darkred', 'alpha': 0.3, 'label': 'Превышение макс. давления'},
+    'x_p': {'color': 'orange', 'alpha': 0.3, 'label': 'Превышение макс. длины ствола'},
+    'p_mz': {'color': 'purple', 'alpha': 0.3, 'label': 'Превышение макс. дульного среднебаллист. давления'},
+    'Acc': {'color': 'pink', 'alpha': 0.3, 'label': 'Превышение макс. ускорения снаряда'},
+    'steps_max': {'color': 'black', 'alpha': 0.3, 'label': 'Максимальное количество шагов'}
+}  
+
+def getPsr(res):
+    PS = list()
+    for layer in res['layers']:
+        xs = layer['x']
+        x_c = (xs[:-1]+xs[1:])/2
+        ps = layer['p']
+        S = np.sum(0.5*(x_c[1:]-x_c[:-1])*(ps[1:]+ps[:-1]))
+        p = S / (x_c[-1] - x_c[0])
+        PS.append(p)
+    return PS
+
+def getGs(res):
+    v_ps = np.array([lr['u'][-1] for lr in res['layers']])
+    ts = np.array([lr['t'] for lr in res['layers']])
+    gs = (v_ps[1:] - v_ps[:-1]) / (ts[1:] - ts[:-1])
+    return np.max(gs) / 9.81
+
+
+    def get_rnd(otn_m_z_min, otn_m_z_max, delta_min, delta_max, porox, **kwargs):
+    otn_m_z = np.random.uniform(otn_m_z_min, otn_m_z_max)
+    delta = np.random.uniform(delta_min, delta_max)
+    return full_calc(otn_m_z, delta, porox, **kwargs)
+
+
+
+
+def full_calc(otn_m_z, delta, porox, ret_all=True):
+
+    q = 43.56
+    omega = q * otn_m_z
+    W_0 = omega/delta
+    d = 0.1524
+    n_S = 1.04
+    opts = {
+              'powders': [{'omega': omega, 'dbname': porox}],
+              'init_conditions': {
+                  'q': q,
+                   'd': d,
+                   'W_0': W_0,
+                   'phi_1': 1.04,
+                   'p_0': 30e6,
+                    'n_S': n_S
+                    },
+              'igniter': {'p_ign_0': 5e6},
+              'heat':{'enabled':True, 'heat_barrel':True},
+              'windage':{'shock_wave':True},
+                'meta_lagrange': {
+                    'n_cells': 300, 
+                    'CFL': 0.9},
+                'stop_conditions': {
+               'steps_max': 100000,  
+                    'x_p': 5.334,
+                    'p_max':350e6,
+                    'v_p': 500
+                    }
+                 }
+    
+    res20 = ozvb_lagrange(opts)
+    results = {
+        'args': {
+            'otn_m_z': otn_m_z,
+            'delta': delta,
+            'pname': porox,
+            'ret_all': ret_all }
+    }
+    if ret_all:
+        results['res20'] = res20
+        
+    if res20['stop_reason'] != 'v_p':
+        results['isgood'] = False
+        results['label'] = res20['stop_reason']
+        results['criteria'] = 99  
+        
+        return results
+    
+    #Ограничение 1
+    opts['init_conditions']['T_0'] = 273.15 + 50
+    opts['stop_conditions'] = {
+        'x_p': res20['layers'][-1]['x'][-1], 
+        'steps_max': 100000
+            }
+      
+    res50 = ozvb_lagrange(opts)
+    
+    if ret_all:
+        results['res50'] = res50
+    
+    
+    if res50['stop_reason'] != 'x_p':
+        results['isgood'] = False
+        results['label'] = res50['stop_reason']
+        results['criteria'] = 99
+        
+        return results
+    
+    
+    
+    PSR50 = getPsr(res50)
+    
+    if PSR50[-1] > 150e6:
+        results['isgood'] = False
+        results['label'] = 'p_mz'
+        results['criteria'] = 99 
+    
+        return results
+    
+    # Ограничениe 2
+    
+    
+    
+    Acc = getGs(res50)
+    
+    if Acc > 13000:
+        results['isgood'] = False
+        results['label'] = 'Acc'
+        results['criteria'] = 99
+    
+        return results
+    
+    results['isgood'] = True
+    results['label'] = 'good'
+    results['criteria'] = W_0 + res20['layers'][-1]['x'][-1] * n_S * np.pi * d ** 2 /4
+        
+    
+    return results
+
+
+
+
+def plot_results(results):
+    global z
+    plt.figure(figsize=(9,6), dpi = 300)
+    groups = {}
+    for res in results:
+        label = res['label']
+        if label not in groups:
+            groups[label] = []
+        groups[label].append(res)
+    for label, group in groups.items():
+        xs, ys, crits = [], [], []
+        for res in group:
+            xs.append(res['args']['otn_m_z'])
+            ys.append(res['args']['delta'])
+            crits.append(res['criteria'])
+        if label == 'good':
+            plt.scatter(xs, ys, c=crits, label=label, cmap=newcmp, zorder=3)
+            cb = plt.colorbar()
+            cb.set_label('$W_{pm}$')
+            
+            i_best = np.argmin(crits)
+            
+            file = {'Порох': porox, 'Объем': crits[i_best],'Отн.масса заряда': xs[i_best],'Плотность заряжания': ys[i_best]}
+            z.append(file)
+            
+            print('Относительная масса заряда: ', xs[i_best],'Плотность заряжания: ', ys[i_best], 'Наименьший объем камеры: ', crits[i_best])
+            
+            plt.scatter([xs[i_best]], [ys[i_best]], marker='*', s=250, color='red', 
+                        edgecolor='black', label=f'BEST {crits[i_best]:.3f}', zorder=4)
+        else:
+            plt.scatter(xs, ys, **styles.get(label, {}))
+            
+    
+    
+    plt.grid()
+    plt.legend()
+    plt.show()
+    
+    
+def plot_result(result):
+    fig = plt.figure(figsize = (12, 12), dpi = 600)
+
+    ax1 = fig.add_subplot(4,1,1)
+    p20 = []
+    x_p = []
+    vs = []
+    for layer in result['res20']['layers']:
+        x_p.append(layer['x'][-1])
+        vs.append(layer['u'][-1])
+        xs = layer['x']
+        x_c = (xs[:-1]+xs[1:])/2
+        ps = layer['p']
+        S = np.sum(0.5*(x_c[1:]-x_c[:-1])*(ps[1:]+ps[:-1]))
+        p = S / (x_c[-1] - x_c[0])/1e6
+        p20.append(p)
+    ax1.plot(x_p, p20)
+    
+    plt.text(0.55, 360, 'Макс. допустимое среднебаллист. давление')
+    ax1.axhline(350, color='gray', linestyle='--')
+    #ax1.axhline(150, color='gray', linestyle='--')
+    plt.text(1.5, 250, 'При +20 градусах')
+    
+    plt.xlabel('$x_{p}, м$', fontsize=14)
+    plt.ylabel('$p_{m}, МПа$', fontsize=14)
+    plt.ylim(0, 400)
+    ax1.grid()
+     
+        
+        
+        
+    ax2 = fig.add_subplot(4,1,2)
+    ax2.plot(x_p, vs)
+    plt.xlabel('$x_{p}, м$', fontsize=14)
+    plt.ylabel('$v_{p}, м/с$', fontsize=14)
+    #ax2.vlines(l20[-1], 0, 750, color='gray', linestyle='--')
+    plt.text(0.6, 610, 'Обеспечение дульной скорости')
+    plt.ylim(0, 600)
+    ax2.axhline(500 ,color='gray',linestyle='--')
+    ax2.grid() 
+    
+    
+    ax3 = fig.add_subplot(4,1,3)
+    p50 = []
+    x_p = []
+    ts = []
+    vs = []
+    
+    for layer in result['res50']['layers']:
+        vs.append(layer['u'][-1])
+        x_p.append(layer['x'][-1])
+        ts.append(layer['t'])
+        
+        xs = layer['x']
+        x_c = (xs[:-1]+xs[1:])/2
+        ps = layer['p']
+        gs.append(layer[''])
+        S = np.sum(0.5*(x_c[1:]-x_c[:-1])*(ps[1:]+ps[:-1]))
+        p = S / (x_c[-1] - x_c[0])/1e6
+        
+        p50.append(p)
+    ax3.plot(x_p, p50)
+    
+    plt.text(0.55, 160, 'Макс. допустимое дульное среднебаллист. давление')
+    ax3.axhline(150, color='gray', linestyle='--')
+    plt.text(1.5, 250, 'При +50 градусах')
+    
+    plt.xlabel('$t, мс$', fontsize=14)
+    plt.ylabel('$p_{m}, МПа$', fontsize=14)
+    plt.ylim(0, 500)
+    ax3.grid()
+    
+    
+    ax4 = fig.add_subplot(4,1,4)
+    
+    gs = (vs[1:] - vs[:-1]) / (ts[1:] - ts[:-1])
+    
+    ax4.plot(x_p, gs)
+    
+    ax4.axhline(13000, color='gray', linestyle='--')
+    #ax4.vlines(1, 0, result['layers']['res50']['psi_1'][-1], color='gray', linestyle='--')
+    plt.text(2.6, 5000, 'При +50 градусах')
+    plt.text(2.6, 7500, 'Макс. допустимое ускорение снаряда')
+    plt.xlabel('$x_{p}, м$', fontsize=14)
+    plt.ylabel('$g_{p}, м/с^{2}$', fontsize=14)
+    plt.ylim(0, 13500)
+    ax4.grid()  
+   
+
+
+
+
+    
+    plt.savefig('показательные графики.png', bbox_inches='tight')
+    plt.show()   
+
+
+    z = list()
+for porox in tqdm(dbname):
+    results = []
+    print(porox)
+    for i in tqdm(range(2000)):
+        res = get_rnd(0.01, 1, 50, 1200, porox, ret_all=False)
+        results.append(res)
+    plot_results(results)
+
+data_pow = pd.DataFrame(z)
+data_pow.to_csv('porox',index = False)
+
+df = pd.read_csv('porox', delimiter = ',')
+df
+
+kolvo = len(df['Объем'])
+volume = df['Объем'][0]
+for i in range(kolvo):
+    if df['Объем'][i] < volume:
+        name = df['Порох'][i]
+        volume = df['Объем'][i]
+print(name)
+
+x1_min = float(df[df['Объем'] == df['Объем'].min()]['Отн.масса заряда'])
+y1_min = float(df[df['Объем'] == df['Объем'].min()]['Плотность заряжания'])
+
+volume = df['Объем'][0]
+for i in range(kolvo):
+    if df['Порох'][i] == '':
+        print('Лучшее решение')
+    elif df['Объем'][i] < volume:
+        name2 = df['Порох'][i]
+        volume = df['Объем'][i]
+        otn_m_z2 = df['Отн.масса заряда'][i]
+        delta2 = df['Плотность заряжания'][i]
+print(name2)
+
+volume = df['Объем'][0]
+for i in range(kolvo):
+    if df['Порох'][i] == '' or df['Порох'][i] == '':
+        print('Лучшее решение')
+    elif df['Объем'][i] < volume:
+        name3 = df['Порох'][i]
+        
+        volume = df['Объем'][i]
+        otn_m_z3 = df['Отн.масса заряда'][i]
+        delta3 = df['Плотность заряжания'][i]
+print(name3)
+
+plt.figure(dpi = 600, figsize = (8, 6))
+plt.scatter(df['Отн.масса заряда'], df['Плотность заряжания'], c = df['Объем'])
+plt.scatter(x1_min, y1_min, marker = '*', s = 200, label = 'Лучшее решение ')
+plt.scatter(otn_m_z2, delta2, marker = 'o', s = 100, label = 'Второе решение ')
+plt.scatter(otn_m_z3, delta3, marker = '^', s = 200, label = 'Третье решение ')
+
+plt.xlabel('$\\omega/q$', fontsize=12)
+plt.ylabel('$\\Delta, кг/м^{3}$ ', fontsize=12, rotation = 0)
+plt.legend()
+plt.colorbar()
+plt.grid()
+plt.savefig('МДБР.png')
+plt.show()
+
+
+
+
+poroxa = []
+kolvo = len(df['Объем'])
+for i in range(kolvo):
+    if df['Объем'][i] < 0.039:
+        poroxa.append(df['Порох'][i])
+print(poroxa)
+
+
+z = list()
+for porox in tqdm(poroxa):
+    results = []
+    print(porox)
+    for i in tqdm(range(5000)):
+        res = get_rnd(0.01, 0.4, 200, 900, porox, ret_all=False)
+        results.append(res)
+    plot_results(results)
+    
+data_pow = pd.DataFrame(z)
+data_pow.to_csv('better_porox',index = False)
+
+
+df = pd.read_csv('better_porox', delimiter = ',')
+df
+
+
+z = list()
+porox = '16/1 тр'   
+results = []
+for delta in tqdm(range(500, 700, 1)):
+    otn_m_z = 0.1 
+    while otn_m_z <= 0.15:
+        res = full_calc(otn_m_z, delta, porox, ret_all=False)
+        otn_m_z += 0.002
+        results.append(res)               
+plot_results(results)
+
+
+kolvo = len(df['Объем'])
+volume = df['Объем'][0]
+for i in range(kolvo):
+    if df['Объем'][i] < volume:
+        name = df['Порох'][i]
+        volume = df['Объем'][i]
+print(name)
+
+x1_min = float(df[df['Объем'] == df['Объем'].min()]['Отн.масса заряда'])
+y1_min = float(df[df['Объем'] == df['Объем'].min()]['Плотность заряжания'])
+
+volume = df['Объем'][0]
+for i in range(kolvo):
+    if df['Порох'][i] == '15/1 тр В/А':
+        print('Лучшее решение')
+    elif df['Объем'][i] < volume:
+        name2 = df['Порох'][i]
+        volume = df['Объем'][i]
+        otn_m_z2 = df['Отн.масса заряда'][i]
+        delta2 = df['Плотность заряжания'][i]
+print(name2)
+
+volume = df['Объем'][0]
+for i in range(kolvo):
+    if df['Порох'][i] == '15/1 тр В/А' or df['Порох'][i] == '12/1 Тр':
+        print('Лучшее решение')
+    elif df['Объем'][i] < volume:
+        name3 = df['Порох'][i]
+        volume = df['Объем'][i]
+        otn_m_z3 = df['Отн.масса заряда'][i]
+        delta3 = df['Плотность заряжания'][i]
+print(name3)
+
+plt.figure(dpi = 600, figsize = (8, 6))
+plt.scatter(df['Отн.масса заряда'], df['Плотность заряжания'], c = df['Объем'])
+plt.scatter(x1_min, y1_min, marker = '*', s = 200, label = 'Лучшее решение 15/1 тр В/А')
+plt.scatter(otn_m_z2, delta2, marker = 'o', s = 100, label = 'Второе решение 12/1 Тр')
+plt.scatter(otn_m_z3, delta3, marker = '^', s = 200, label = 'Третье решение ДГ-4 13/1')
+
+plt.xlabel('$\\omega/q$', fontsize=12)
+plt.ylabel('$\\Delta, кг/м^{3}$ ', fontsize=12, rotation = 0)
+plt.legend()
+plt.colorbar()
+plt.grid()
+plt.savefig('МДБР2.png')
+plt.show()
+
+
+result = full_calc(, , '', ret_all=True)
+plot_result(result)
